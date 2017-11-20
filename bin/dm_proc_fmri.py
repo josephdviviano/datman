@@ -126,9 +126,13 @@ def run_epitome(path, config, study):
     Finds the appropriate inputs for input subject, builds a temporary epitome
     folder, runs epitome, and finally copies the outputs to the fmri_dir.
     """
+    # TODO: path points to input nifti data folder (raw), variable name should
+    # be more explicit.
     study_base = config.get_study_base(study)
     subject = os.path.basename(path)
     nii_dir = os.path.join(study_base, config.site_config['paths']['nii'])
+
+    # NB: we now use the HCP folder for our surface-space outputs and volume segmentation
     t1_dir = os.path.join(study_base, config.site_config['paths']['hcp'])
     fmri_dir = utils.define_folder(os.path.join(study_base, config.site_config['paths']['fmri']))
     experiments = config.study_config['fmri'].keys()
@@ -151,7 +155,9 @@ def run_epitome(path, config, study):
         if os.path.isfile(error_log):
             os.remove(error_log)
 
-        failed = False
+        failed = False # will be triggered if any input datatype isn't there or
+                       # exists in the wrong number (i.e., only 2/3 files exist
+                       # for a tag given what is defined in ExportInfo).
 
         if type(expected_tags) == str:
             expected_tags = [expected_tags]
@@ -193,7 +199,7 @@ def run_epitome(path, config, study):
         if failed:
             continue
 
-        # create and populate epitome directory
+        # create and populate epitome directory in the local /tmp folder
         epi_dir = tempfile.mkdtemp()
         utils.make_epitome_folders(epi_dir, len(functionals))
         epi_t1_dir = '{}/TEMP/SUBJ/T1/SESS01'.format(epi_dir)
@@ -203,6 +209,10 @@ def run_epitome(path, config, study):
             shutil.copyfile(anatomicals[0], '{}/anat_aparc_brain.nii.gz'.format(epi_t1_dir))
             shutil.copyfile(anatomicals[1], '{}/anat_aparc2009_brain.nii.gz'.format(epi_t1_dir))
             shutil.copyfile(anatomicals[2], '{}/anat_T1_brain.nii.gz'.format(epi_t1_dir))
+
+            # because epitome is run session-wise via datman's session construct
+            # (meaning each datman folder contains the session ID), we only ever
+            # use SESS01 for functional and anatomical data in epitome
             for i, d in enumerate(functionals):
                 shutil.copyfile(d, '{}/RUN{}/FUNC.nii.gz'.format(epi_func_dir, '%02d' % (i + 1)))
         except IOError as e:
@@ -218,6 +228,7 @@ def run_epitome(path, config, study):
         delete = config.study_config['fmri'][exp]['del']
         pipeline =  config.study_config['fmri'][exp]['pipeline']
 
+        # pipeline scripts must be in assets/ directory in the datman project
         pipeline = os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, 'assets/{}'.format(pipeline))
         if not os.path.isfile(pipeline):
             raise Exception('invalid pipeline {} defined!'.format(pipeline))
@@ -241,6 +252,13 @@ def run_epitome(path, config, study):
                 matches = filter(lambda x: 'func_' + name in x, epitome_outputs)
                 matches.sort()
 
+                # export all anatomical / registration information before
+                # attempting to export fmri data as these files are often
+                # diagnostics of pipeline problems
+                export_file_list('anat_', epitome_outputs, output_dir)
+                export_file_list('reg_',  epitome_outputs, output_dir)
+                export_file_list('mat_',  epitome_outputs, output_dir)
+
                 # attempt to export the defined epitome stages for all runs
                 if len(matches) != len(functionals):
                     error_message = 'epitome output {} not created for all inputs'.format(name)
@@ -252,11 +270,6 @@ def run_epitome(path, config, study):
                     func_basename = utils.splitext(os.path.basename(functionals[i]))[0]
                     func_output = os.path.join(output_dir, func_basename + '_{}.nii.gz'.format(name))
                     export_file(match, func_output)
-
-                # export all anatomical / registration information
-                export_file_list('anat_', epitome_outputs, output_dir)
-                export_file_list('reg_',  epitome_outputs, output_dir)
-                export_file_list('mat_',  epitome_outputs, output_dir)
 
                 # export PARAMS folder
                 export_directory(os.path.join(epi_func_dir, 'PARAMS'), os.path.join(output_dir, 'PARAMS'))
@@ -296,6 +309,7 @@ def main():
 
     study_base = config.get_study_base(study)
 
+    # check config is correctly formatted
     for k in ['nii', 'fmri', 'hcp']:
         if k not in config.site_config['paths']:
             logger.error("paths:{} not defined in site config".format(k))
@@ -309,6 +323,7 @@ def main():
 
     nii_dir = os.path.join(study_base, config.site_config['paths']['nii'])
 
+    # if script is submitted with subject field intact, then run epitome
     if scanid:
         path = os.path.join(nii_dir, scanid)
         if '_PHA_' in scanid:
@@ -319,9 +334,9 @@ def main():
             logging.error(e)
             sys.exit(1)
 
-    # run in batch mode
+    # else, run script in batch mode, i.e., submit jobs for unfinished subjects
     else:
-        subjects = []
+        subjects = [] # list of subjects to process on the queue
         nii_dirs = glob.glob('{}/*'.format(nii_dir))
 
         # find subjects where at least one expected output does not exist
@@ -334,12 +349,15 @@ def main():
 
             fmri_dir = utils.define_folder(os.path.join(study_base, config.site_config['paths']['fmri']))
             for exp in config.study_config['fmri'].keys():
+
+                # look for expected outputs (defined in config file)
                 expected_names = config.study_config['fmri'][exp]['export']
                 subj_dir = os.path.join(fmri_dir, exp, subject)
                 if not outputs_exist(subj_dir, expected_names):
                     subjects.append(subject)
                     break
 
+        # set used to remove duplicates of subject names
         subjects = list(set(subjects))
 
         # submit a list of calls to ourself, one per subject
